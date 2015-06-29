@@ -139,6 +139,8 @@ func (a *adapter) startMumbleConnection() error {
 					break
 				}
 			}
+
+			a.setSelfAvatar()
 		},
 
 		TextMessage: func(e *gumble.TextMessageEvent) {
@@ -227,4 +229,13 @@ func (a *adapter) chooseRoomFromEvent(e *gumble.TextMessageEvent) string {
 	}
 
 	return "(UNKNOWN)"
+}
+
+func (a *adapter) setSelfAvatar() {
+	data, err := Asset("store/avatar.png")
+	if err != nil {
+		return
+	}
+
+	a.client.Self.SetTexture(data)
 }
