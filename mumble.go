@@ -1,12 +1,9 @@
 package mumble
 
 import (
-	"crypto/tls"
 	"errors"
 	"html"
-	"io"
 	"net"
-	"os/exec"
 	"strconv"
 	"strings"
 	"time"
@@ -15,6 +12,7 @@ import (
 	"github.com/layeh/gumble/gumble"
 	"github.com/layeh/gumble/gumble_ffmpeg"
 	"github.com/layeh/gumble/gumbleutil"
+	_ "github.com/layeh/gumble/opus"
 	"github.com/nightexcessive/hal"
 
 	"github.com/nightexcessive/hal-mumble/htmlutil"
@@ -128,8 +126,6 @@ func (a *adapter) speak(str string) error {
 		Response: c,
 	}
 
-	hal.Logger.Debugf("mumble: speaking %q", str)
-
 	return <-c
 }
 
@@ -154,17 +150,15 @@ func (a *adapter) Stop() error {
 }
 
 func (a *adapter) startMumbleConnection() error {
-	conn := gumble.NewClient(&gumble.Config{
-		Address:  net.JoinHostPort(a.server, strconv.Itoa(a.port)),
-		Username: a.Robot.Name,
-		Password: a.password,
+	config := gumble.NewConfig()
 
-		TLSConfig: tls.Config{
-			InsecureSkipVerify: true,
-		},
+	config.Address = net.JoinHostPort(a.server, strconv.Itoa(a.port))
+	config.Username = a.Robot.Name
+	config.Password = a.password
+	config.TLSConfig.InsecureSkipVerify = true
+	config.AudioInterval = 10 * time.Millisecond
 
-		AudioInterval: 10 * time.Millisecond,
-	})
+	conn := gumble.NewClient(config)
 
 	conn.Attach(gumbleutil.AutoBitrate)
 	conn.Attach(&gumbleutil.Listener{
@@ -229,12 +223,13 @@ func (a *adapter) startMumbleConnection() error {
 		},
 	})
 
+	a.client = conn
+
 	err := conn.Connect()
 	if err != nil {
 		return err
 	}
 
-	a.client = conn
 	hal.Logger.Debug("mumble: connecting...")
 
 	return nil
@@ -288,8 +283,9 @@ func (a *adapter) ttsGoRoutine() {
 	stream := gumble_ffmpeg.New(a.client)
 	defer stream.Stop()
 
+	stream.Volume = 0.25
+
 	for req := range a.speakChan {
-		hal.Logger.Debugf("mumble: received TTS request: %#v", req)
 		a.handleSpeakRequest(stream, req)
 	}
 }
@@ -301,7 +297,7 @@ func (a *adapter) handleSpeakRequest(stream *gumble_ffmpeg.Stream, req ttsReques
 		}
 	}()
 
-	source, err := a.getFestivalSource(req.Text)
+	source, err := a.getTTSSource(req.Text)
 	if err != nil {
 		req.Response <- err
 		return
@@ -313,48 +309,58 @@ func (a *adapter) handleSpeakRequest(stream *gumble_ffmpeg.Stream, req ttsReques
 		return
 	}
 
-	hal.Logger.Debugf("mumble: speaking: %q", req.Text)
 	stream.Wait()
-	hal.Logger.Debugf("mumble: done speaking: %q", req.Text)
 }
 
-func (a *adapter) getFestivalSource(str string) (gumble_ffmpeg.Source, error) {
-	cmd := exec.Command("text2wave", "-f", "16000", "-scale", "1.2", "-eval", "(voice_nitech_us_slt_arctic_hts)")
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		return nil, err
-	}
-	defer stdin.Close()
-
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, err
-	}
-
-	err = cmd.Start()
-	if err != nil {
-		return nil, err
-	}
-
-	_, err = io.WriteString(stdin, str)
-	if err != nil {
-		return nil, err
-	}
-
-	return gumble_ffmpeg.SourceReader(&festivalSource{
-		ReadCloser: stdout,
-		cmd:        cmd,
-	}), nil
+func (a *adapter) getTTSSource(str string) (gumble_ffmpeg.Source, error) {
+	return gumble_ffmpeg.SourceExec("picospeaker", "--type", "wav", "--output", "-", str), nil
+	//return &festivalSource{str: str}, nil
 }
 
-type festivalSource struct {
-	io.ReadCloser
+/*type festivalSource struct {
+	str string
+
 	cmd *exec.Cmd
 }
 
-func (s *festivalSource) Close() error {
-	s.cmd.Process.Kill()
-	s.cmd.Wait()
-
-	return s.ReadCloser.Close()
+func (*festivalSource) Arguments() []string {
+	return []string{"-i", "-"}
 }
+
+func (s *festivalSource) Start(cmd *exec.Cmd) error {
+	s.cmd = exec.Command("text2wave", "-f", "16000", "-scale", "1.2", "-eval", "(voice_nitech_us_slt_arctic_hts)")
+
+	r, err := s.cmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+
+	cmd.Stdin = r
+
+	stdin, err := s.cmd.StdinPipe()
+	if err != nil {
+		return err
+	}
+	defer stdin.Close()
+
+	if err := s.cmd.Start(); err != nil {
+		cmd.Stdin = nil
+		return err
+	}
+
+	_, err = io.WriteString(stdin, s.str)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (s *festivalSource) Done() {
+	if s.cmd != nil {
+		if p := s.cmd.Process; p != nil {
+			p.Kill()
+		}
+		s.cmd.Wait()
+	}
+}*/
