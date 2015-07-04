@@ -4,12 +4,16 @@ import (
 	"crypto/tls"
 	"errors"
 	"html"
+	"io"
 	"net"
+	"os/exec"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/danryan/env"
 	"github.com/layeh/gumble/gumble"
+	"github.com/layeh/gumble/gumble_ffmpeg"
 	"github.com/layeh/gumble/gumbleutil"
 	"github.com/nightexcessive/hal"
 
@@ -23,11 +27,18 @@ func init() {
 // adapter struct
 type adapter struct {
 	hal.BasicAdapter
-	server   string
-	port     int
-	password string
-	channel  string
-	client   *gumble.Client
+	server    string
+	port      int
+	password  string
+	channel   string
+	speakChan chan ttsRequest
+	client    *gumble.Client
+}
+
+type ttsRequest struct {
+	Text string
+
+	Response chan error
 }
 
 type config struct {
@@ -43,10 +54,11 @@ func New(robot *hal.Robot) (hal.Adapter, error) {
 	env.MustProcess(c)
 
 	a := &adapter{
-		server:   c.Server,
-		port:     c.Port,
-		password: c.Password,
-		channel:  strings.ToLower(c.Channel),
+		server:    c.Server,
+		port:      c.Port,
+		password:  c.Password,
+		channel:   strings.ToLower(c.Channel),
+		speakChan: make(chan ttsRequest),
 	}
 
 	a.SetRobot(robot)
@@ -93,9 +105,32 @@ func (a *adapter) Topic(res *hal.Response, strings ...string) error {
 	return errNotImplemented
 }
 
-// Play is not implemented.
+// Play plays phrases via text-to-speech
 func (a *adapter) Play(res *hal.Response, strings ...string) error {
-	return errChannelNotFound
+	if res.Message.Room != a.client.Self.Channel.Name {
+		return errChannelNotFound
+	}
+
+	for _, str := range strings {
+		if err := a.speak(str); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (a *adapter) speak(str string) error {
+	c := make(chan error, 1)
+	a.speakChan <- ttsRequest{
+		Text: str,
+
+		Response: c,
+	}
+
+	hal.Logger.Debugf("mumble: speaking %q", str)
+
+	return <-c
 }
 
 // Receive forwards a message to the robot
@@ -127,8 +162,11 @@ func (a *adapter) startMumbleConnection() error {
 		TLSConfig: tls.Config{
 			InsecureSkipVerify: true,
 		},
+
+		AudioInterval: 10 * time.Millisecond,
 	})
 
+	conn.Attach(gumbleutil.AutoBitrate)
 	conn.Attach(&gumbleutil.Listener{
 		Connect: func(e *gumble.ConnectEvent) {
 			hal.Logger.Debug("mumble: connected")
@@ -141,6 +179,12 @@ func (a *adapter) startMumbleConnection() error {
 			}
 
 			a.setSelfAvatar()
+
+			go a.ttsGoRoutine()
+		},
+
+		Disconnect: func(e *gumble.DisconnectEvent) {
+			close(a.speakChan)
 		},
 
 		TextMessage: func(e *gumble.TextMessageEvent) {
@@ -238,4 +282,79 @@ func (a *adapter) setSelfAvatar() {
 	}
 
 	a.client.Self.SetTexture(data)
+}
+
+func (a *adapter) ttsGoRoutine() {
+	stream := gumble_ffmpeg.New(a.client)
+	defer stream.Stop()
+
+	for req := range a.speakChan {
+		hal.Logger.Debugf("mumble: received TTS request: %#v", req)
+		a.handleSpeakRequest(stream, req)
+	}
+}
+
+func (a *adapter) handleSpeakRequest(stream *gumble_ffmpeg.Stream, req ttsRequest) {
+	defer func() {
+		if req.Response != nil {
+			close(req.Response)
+		}
+	}()
+
+	source, err := a.getFestivalSource(req.Text)
+	if err != nil {
+		req.Response <- err
+		return
+	}
+
+	stream.Source = source
+	if err := stream.Play(); err != nil {
+		req.Response <- err
+		return
+	}
+
+	hal.Logger.Debugf("mumble: speaking: %q", req.Text)
+	stream.Wait()
+	hal.Logger.Debugf("mumble: done speaking: %q", req.Text)
+}
+
+func (a *adapter) getFestivalSource(str string) (gumble_ffmpeg.Source, error) {
+	cmd := exec.Command("text2wave", "-f", "16000", "-scale", "1.2", "-eval", "(voice_nitech_us_slt_arctic_hts)")
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, err
+	}
+	defer stdin.Close()
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, err
+	}
+
+	err = cmd.Start()
+	if err != nil {
+		return nil, err
+	}
+
+	_, err = io.WriteString(stdin, str)
+	if err != nil {
+		return nil, err
+	}
+
+	return gumble_ffmpeg.SourceReader(&festivalSource{
+		ReadCloser: stdout,
+		cmd:        cmd,
+	}), nil
+}
+
+type festivalSource struct {
+	io.ReadCloser
+	cmd *exec.Cmd
+}
+
+func (s *festivalSource) Close() error {
+	s.cmd.Process.Kill()
+	s.cmd.Wait()
+
+	return s.ReadCloser.Close()
 }
